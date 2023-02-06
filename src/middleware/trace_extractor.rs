@@ -8,7 +8,6 @@ use axum::{
     response::Response,
 };
 use http::{header, uri::Scheme, HeaderMap, Method, Request, Version};
-use opentelemetry::trace::{TraceContextExt, TraceId};
 use std::{borrow::Cow, net::SocketAddr, time::Duration};
 use tower_http::{
     classify::{ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier},
@@ -134,8 +133,6 @@ impl<B> MakeSpan<B> for OtelMakeSpan {
             .unwrap_or_default();
         let http_method_v = http_method(req.method());
         let name = format!("{http_method_v} {http_route}");
-        let (remote_context, trace_id) =
-            create_context_with_trace(extract_remote_context(req.headers()));
         let span = tracing::info_span!(
             "HTTP request",
             otel.name= %name,
@@ -150,9 +147,11 @@ impl<B> MakeSpan<B> for OtelMakeSpan {
             http.user_agent = %user_agent,
             otel.kind = %"server", //opentelemetry::trace::SpanKind::Server
             otel.status_code = Empty,
-            trace_id = %trace_id,
         );
-        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, remote_context);
+        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(
+            &span,
+            extract_remote_context(req.headers()),
+        );
         span
     }
 }
@@ -215,38 +214,6 @@ fn extract_remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
     }
     let extractor = HeaderExtractor(headers);
     opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
-}
-
-//HACK create a context with a trace_id (if not set) before call to
-// `tracing_opentelemetry::OpenTelemetrySpanExt::set_parent`
-// else trace_id is defined too late and the `info_span` log `trace_id: ""`
-// Use the default global tracer (named "") to start the trace
-fn create_context_with_trace(
-    remote_context: opentelemetry::Context,
-) -> (opentelemetry::Context, TraceId) {
-    if !remote_context.span().span_context().is_valid() {
-        // create a fake remote context but with a fresh new trace_id
-        use opentelemetry::sdk::trace::IdGenerator;
-        use opentelemetry::sdk::trace::RandomIdGenerator;
-        use opentelemetry::trace::{SpanContext, SpanId};
-        let trace_id = RandomIdGenerator::default().new_trace_id();
-        let new_span_context = SpanContext::new(
-            trace_id,
-            SpanId::INVALID,
-            remote_context.span().span_context().trace_flags(),
-            false,
-            remote_context.span().span_context().trace_state().clone(),
-        );
-        (
-            remote_context.with_remote_span_context(new_span_context),
-            trace_id,
-        )
-    } else {
-        let remote_span = remote_context.span();
-        let span_context = remote_span.span_context();
-        let trace_id = span_context.trace_id();
-        (remote_context, trace_id)
-    }
 }
 
 /// Callback that [`Trace`] will call when it receives a request.
